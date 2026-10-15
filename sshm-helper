@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# sshm-helper: import hosts into the ssh config used by sshm and sort them into
+# per-cluster config files.
+# sshm reads ~/.ssh/config and stores tags as a "# Tags: a, b" comment
+# directly above each Host block, so entries are written in that format.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+Usage:
+  $(basename "$0") import-inventory   <hosts.yaml>      [tag1,tag2,...] [ssh_config]
+  $(basename "$0") import-known-hosts <ssh_known_hosts> [tag1,tag2,...] [ssh_config]
+  $(basename "$0") move-cluster       [cluster[,cluster...]] [ssh_config]
+
+import-*      append hosts to ssh_config; without tags you are asked whether to set some.
+move-cluster  move all hosts of a cluster (host name minus "-<role>-<index>") into
+              config_<cluster> next to ssh_config and Include it. Without cluster
+              names a table is shown to pick from (fzf, TAB to multi-select).
+
+ssh_config defaults to ~/.ssh/config.
+EOF
+    exit 1
+}
+
+backup() {
+    cp "$1" "$1.bak.$(date +%Y%m%d%H%M%S)"
+}
+
+# import <file> <tags> <ssh_config> <awk program printing "host ip" pairs>
+import_hosts() {
+    local src="$1" tags_raw="$2" ssh_config="$3" parser="$4"
+
+    [[ -r "$src" ]] || { echo "error: cannot read $src" >&2; exit 1; }
+
+    if [[ -z "$tags_raw" ]]; then
+        read -r -p "Set tags? [y/N] " answer || true
+        if [[ "$answer" =~ ^[Yy] ]]; then
+            read -r -p "Tags (comma-separated): " tags_raw || true
+        fi
+    fi
+
+    # "cah,cluster-demo-1" -> "cah, cluster-demo-1" (format sshm writes)
+    local tags
+    tags="$(sed -E 's/[[:space:]]*,[[:space:]]*/, /g; s/^[[:space:]]+|[[:space:]]+$//g' <<<"$tags_raw")"
+
+    mkdir -p "$(dirname "$ssh_config")"
+    touch "$ssh_config"
+    chmod 600 "$ssh_config"
+    backup "$ssh_config"
+
+    local added=0 skipped=0 host ip
+    while read -r host ip; do
+        [[ -z "$host" || -z "$ip" ]] && continue
+
+        if grep -qE "^[[:space:]]*Host[[:space:]]+(.*[[:space:]])?${host//./\\.}([[:space:]]|$)" "$ssh_config"; then
+            echo "skip: $host already in $ssh_config"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        {
+            # blank separator line if file is non-empty and doesn't end with one
+            if [[ -s "$ssh_config" && -n "$(tail -n1 "$ssh_config")" ]]; then
+                echo
+            fi
+            [[ -n "$tags" ]] && echo "# Tags: $tags"
+            echo "Host $host"
+            echo "    HostName $ip"
+        } >>"$ssh_config"
+
+        echo "add:  $host -> $ip"
+        added=$((added + 1))
+    done < <(awk "$parser" "$src")
+
+    echo "done: $added added, $skipped skipped ($ssh_config)"
+}
+
+# Tarook/Ansible YAML inventory: host keys sit at 4-space indent under <group>.hosts
+inventory_parser='
+    /^    [^ #][^ ]*: *$/ { h = $1; sub(/:$/, "", h); next }
+    /^      local_ipv4_address:/ { print h, $2 }
+'
+
+# "@cert-authority name,ip1,ip2 keytype key" -> "name ip1"
+known_hosts_parser='
+    $1 == "@cert-authority" { n = split($2, f, ","); if (n >= 2) print f[1], f[2] }
+'
+
+# host name -> cluster name ("" if it doesn't look like one),
+# e.g. k8s-cloud-svcs-test-gw-0 -> k8s-cloud-svcs-test
+cluster_fn='function cluster(h) { return match(h, /-[[:alpha:]]+-[[:alnum:]]+$/) ? substr(h, 1, RSTART - 1) : "" }'
+
+move_cluster() {
+    local clusters_raw="$1" ssh_config="$2"
+
+    [[ -r "$ssh_config" ]] || { echo "error: cannot read $ssh_config" >&2; exit 1; }
+
+    local config_dir
+    config_dir="$(cd "$(dirname "$ssh_config")" && pwd)"
+
+    if [[ -z "$clusters_raw" ]]; then
+        command -v fzf >/dev/null || { echo "error: fzf needed for the selection table (or pass cluster names)" >&2; exit 1; }
+
+        # cluster <TAB> host count <TAB> tags
+        local table selection
+        table="$(awk "$cluster_fn"'
+            /^# Tags:/ { tags = $0; sub(/^# Tags:[[:space:]]*/, "", tags); next }
+            /^[[:space:]]*Host[[:space:]]/ {
+                c = cluster($2)
+                if (c != "") { n[c]++; if (!(c in t)) t[c] = tags }
+                tags = ""; next
+            }
+            { tags = "" }
+            END { for (c in n) printf "%s\t%d\t%s\n", c, n[c], t[c] }
+        ' "$ssh_config" | sort)"
+
+        [[ -n "$table" ]] || { echo "no clusters found in $ssh_config"; exit 0; }
+
+        selection="$( (printf 'CLUSTER\tHOSTS\tTAGS\n'; echo "$table") | column -t -s $'\t' |
+            fzf --multi --header-lines=1 --layout=reverse --height=~50% \
+                --prompt="cluster> " --header="TAB: select multiple, ENTER: move" )" || exit 0
+        clusters_raw="$(awk '{ print $1 }' <<<"$selection" | paste -sd,)"
+    fi
+
+    backup "$ssh_config"
+
+    local clusters c target tmp moved inc
+    IFS=',' read -r -a clusters <<<"$clusters_raw"
+    for c in "${clusters[@]}"; do
+        c="$(xargs <<<"$c")"
+        [[ -z "$c" ]] && continue
+
+        target="$config_dir/config_$c"
+        tmp="$(mktemp "$config_dir/.config.XXXXXX")"
+        touch "$target"
+        chmod 600 "$target"
+
+        # Split the config: blocks of cluster $c (with the comments directly above
+        # their Host line) are appended to $target, everything else goes to $tmp.
+        moved="$(awk -v sel="$c" -v out="$target" -v has_out="$([[ -s "$target" ]] && echo 1 || echo 0)" "$cluster_fn"'
+            # blank lines are held back so none are left dangling at the end of the file
+            function keep(s) { if (blank) print ""; blank = 0; print s }
+            function flush() { if (pend != "") keep(substr(pend, 1, length(pend) - 1)); pend = "" }
+            /^[[:space:]]*Host[[:space:]]/ {
+                mv = (cluster($2) == sel); in_block = 1
+                if (mv) {
+                    if (has_out) print "" >> out
+                    printf "%s%s\n", pend, $0 >> out
+                    has_out = 1; pend = ""; count++
+                } else { flush(); keep($0) }
+                next
+            }
+            /^[[:space:]]*$/ {
+                flush()
+                if (!(in_block && mv)) blank = 1    # drop the separator after a moved block
+                in_block = 0; next
+            }
+            /^#/ { in_block = 0; pend = pend $0 "\n"; next }
+            /^[[:space:]]/ && in_block { if (mv) print >> out; else keep($0); next }
+            { flush(); in_block = 0; keep($0) }
+            END { flush(); print count + 0 > "/dev/stderr" }
+        ' "$ssh_config" 2>&1 >"$tmp")"
+
+        if [[ "$moved" -eq 0 ]]; then
+            echo "skip: no hosts for cluster $c"
+            rm -f "$tmp"
+            [[ -s "$target" ]] || rm -f "$target"
+            continue
+        fi
+
+        # Include must come before any Host block, otherwise it only applies inside it.
+        # Relative paths in Include are resolved against ~/.ssh.
+        if [[ "$config_dir" == "$HOME/.ssh" ]]; then inc="config_$c"; else inc="$target"; fi
+        if ! grep -qE "^[[:space:]]*Include[[:space:]]+(.*[[:space:]])?(~/\.ssh/)?${inc//./\\.}([[:space:]]|$)" "$tmp"; then
+            { echo "Include $inc"; [[ -s "$tmp" && -n "$(head -n1 "$tmp")" ]] && echo; cat "$tmp"; } >"$tmp.new"
+            mv "$tmp.new" "$tmp"
+        fi
+
+        chmod 600 "$tmp"
+        mv "$tmp" "$ssh_config"
+        echo "move: $moved hosts of $c -> $target"
+    done
+
+    echo "done"
+}
+
+[[ $# -ge 1 ]] || usage
+cmd="$1"; shift
+
+case "$cmd" in
+    import-inventory|import-known-hosts)
+        [[ $# -lt 1 || $# -gt 3 ]] && usage
+        parser="$inventory_parser"
+        [[ "$cmd" == import-known-hosts ]] && parser="$known_hosts_parser"
+        import_hosts "$1" "${2:-}" "${3:-$HOME/.ssh/config}" "$parser"
+        ;;
+    move-cluster)
+        [[ $# -gt 2 ]] && usage
+        move_cluster "${1:-}" "${2:-$HOME/.ssh/config}"
+        ;;
+    *) usage ;;
+esac
