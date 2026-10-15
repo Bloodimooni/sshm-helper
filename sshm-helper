@@ -9,29 +9,66 @@ set -euo pipefail
 usage() {
     cat >&2 <<EOF
 Usage:
-  $(basename "$0") import-inventory   <hosts.yaml>      [tag1,tag2,...] [ssh_config]
-  $(basename "$0") import-known-hosts <ssh_known_hosts> [tag1,tag2,...] [ssh_config]
-  $(basename "$0") move-cluster       [cluster[,cluster...]] [ssh_config]
+  $(basename "$0") import       <file> [tag1,tag2,...] [ssh_config]
+  $(basename "$0") move-cluster [cluster[,cluster...]] [ssh_config]
+  $(basename "$0") include      [on|off] [ssh_config]
 
-import-*      append hosts to ssh_config; without tags you are asked whether to set some.
+import        append hosts to ssh_config. <file> is either a Tarook/Ansible inventory
+              (hosts.yaml) or an ssh_known_hosts file with @cert-authority lines; the
+              type is detected automatically. Without tags you are asked whether to
+              set some, afterwards whether to move the new clusters into own files.
 move-cluster  move all hosts of a cluster (host name minus "-<role>-<index>") into
-              config_<cluster> next to ssh_config and Include it. Without cluster
+              sshm/config_<cluster> next to ssh_config. The file is not included
+              from ssh_config, open it with "sshm -c <file>". Without cluster
               names a table is shown to pick from (fzf, TAB to multi-select).
+include       include all sshm/config_* files from ssh_config (on), or not (off,
+              the default). Without on/off the current state is toggled.
 
-ssh_config defaults to ~/.ssh/config.
+ssh_config defaults to ~/.ssh/config. Backups go to sshm/backups next to it;
+backups older than 30 days are offered for deletion.
 EOF
     exit 1
 }
 
-backup() {
-    cp "$1" "$1.bak.$(date +%Y%m%d%H%M%S)"
+# Cluster configs and backups live in sshm/ next to the ssh config
+sshm_dir() {
+    echo "$(cd "$(dirname "$1")" && pwd)/sshm"
 }
 
-# import <file> <tags> <ssh_config> <awk program printing "host ip" pairs>
+backup() {
+    local dir answer stale
+    dir="$(sshm_dir "$1")/backups"
+    mkdir -p "$dir"
+    chmod 700 "$(dirname "$dir")" "$dir"
+    # keep the first backup of a second (import + split back up twice in one run)
+    local file="$dir/$(basename "$1").bak.$(date +%Y%m%d%H%M%S)"
+    [[ -e "$file" ]] || cp "$1" "$file"
+
+    mapfile -t stale < <(find "$dir" -maxdepth 1 -type f -name '*.bak.*' -mtime +30)
+    if [[ ${#stale[@]} -gt 0 ]]; then
+        read -r -p "Delete ${#stale[@]} backups older than 30 days in $dir? [y/N] " answer || true
+        if [[ "$answer" =~ ^[Yy] ]]; then
+            rm -f -- "${stale[@]}"
+            echo "deleted ${#stale[@]} stale backups"
+        fi
+    fi
+}
+
 import_hosts() {
-    local src="$1" tags_raw="$2" ssh_config="$3" parser="$4"
+    local src="$1" tags_raw="$2" ssh_config="$3" parser
 
     [[ -r "$src" ]] || { echo "error: cannot read $src" >&2; exit 1; }
+
+    if grep -q '^@cert-authority[[:space:]]' "$src"; then
+        echo "detected: ssh_known_hosts"
+        parser="$known_hosts_parser"
+    elif grep -q '^      local_ipv4_address:' "$src"; then
+        echo "detected: inventory"
+        parser="$inventory_parser"
+    else
+        echo "error: $src is neither an inventory (local_ipv4_address) nor an ssh_known_hosts file (@cert-authority)" >&2
+        exit 1
+    fi
 
     if [[ -z "$tags_raw" ]]; then
         read -r -p "Set tags? [y/N] " answer || true
@@ -49,11 +86,17 @@ import_hosts() {
     chmod 600 "$ssh_config"
     backup "$ssh_config"
 
-    local added=0 skipped=0 host ip
+    # hosts already moved into config_<cluster> files count as present too
+    local existing=("$ssh_config")
+    shopt -s nullglob
+    existing+=("$(sshm_dir "$ssh_config")"/config_*)
+    shopt -u nullglob
+
+    local added=0 skipped=0 host ip new_hosts=()
     while read -r host ip; do
         [[ -z "$host" || -z "$ip" ]] && continue
 
-        if grep -qE "^[[:space:]]*Host[[:space:]]+(.*[[:space:]])?${host//./\\.}([[:space:]]|$)" "$ssh_config"; then
+        if grep -qE "^[[:space:]]*Host[[:space:]]+(.*[[:space:]])?${host//./\\.}([[:space:]]|$)" "${existing[@]}"; then
             echo "skip: $host already in $ssh_config"
             skipped=$((skipped + 1))
             continue
@@ -70,10 +113,20 @@ import_hosts() {
         } >>"$ssh_config"
 
         echo "add:  $host -> $ip"
+        new_hosts+=("$host")
         added=$((added + 1))
     done < <(awk "$parser" "$src")
 
     echo "done: $added added, $skipped skipped ($ssh_config)"
+
+    [[ $added -gt 0 ]] || return 0
+    local clusters
+    clusters="$(printf '%s\n' "${new_hosts[@]}" | awk "$cluster_fn"'{ c = cluster($1) } c != "" && !seen[c]++ { print c }' | paste -sd,)"
+    [[ -n "$clusters" ]] || return 0
+
+    read -r -p "Move clusters into own config files (${clusters//,/, })? [y/N] " answer || true
+    [[ "$answer" =~ ^[Yy] ]] && move_cluster "$clusters" "$ssh_config"
+    return 0
 }
 
 # Tarook/Ansible YAML inventory: host keys sit at 4-space indent under <group>.hosts
@@ -131,7 +184,7 @@ move_cluster() {
         c="$(xargs <<<"$c")"
         [[ -z "$c" ]] && continue
 
-        target="$config_dir/config_$c"
+        target="$config_dir/sshm/config_$c"
         tmp="$(mktemp "$config_dir/.config.XXXXXX")"
         touch "$target"
         chmod 600 "$target"
@@ -139,8 +192,8 @@ move_cluster() {
         # Split the config: blocks of cluster $c (with the comments directly above
         # their Host line) are appended to $target, everything else goes to $tmp.
         moved="$(awk -v sel="$c" -v out="$target" -v has_out="$([[ -s "$target" ]] && echo 1 || echo 0)" "$cluster_fn"'
-            # blank lines are held back so none are left dangling at the end of the file
-            function keep(s) { if (blank) print ""; blank = 0; print s }
+            # blank lines are held back so none are left dangling at the start or end
+            function keep(s) { if (blank && printed) print ""; blank = 0; printed = 1; print s }
             function flush() { if (pend != "") keep(substr(pend, 1, length(pend) - 1)); pend = "" }
             /^[[:space:]]*Host[[:space:]]/ {
                 mv = (cluster($2) == sel); in_block = 1
@@ -169,35 +222,65 @@ move_cluster() {
             continue
         fi
 
-        # Include must come before any Host block, otherwise it only applies inside it.
-        # Relative paths in Include are resolved against ~/.ssh.
-        if [[ "$config_dir" == "$HOME/.ssh" ]]; then inc="config_$c"; else inc="$target"; fi
-        if ! grep -qE "^[[:space:]]*Include[[:space:]]+(.*[[:space:]])?(~/\.ssh/)?${inc//./\\.}([[:space:]]|$)" "$tmp"; then
-            { echo "Include $inc"; [[ -s "$tmp" && -n "$(head -n1 "$tmp")" ]] && echo; cat "$tmp"; } >"$tmp.new"
-            mv "$tmp.new" "$tmp"
-        fi
-
+        # Deliberately no Include: the cluster stays out of the default sshm view
+        # and is opened with "sshm -c <file>".
         chmod 600 "$tmp"
         mv "$tmp" "$ssh_config"
-        echo "move: $moved hosts of $c -> $target"
+        echo "move: $moved hosts of $c -> $target (open with: sshm -c ${target/#$HOME/\~})"
     done
 
     echo "done"
+}
+
+# Add or remove a single "Include sshm/config_*" line at the top of ssh_config
+toggle_include() {
+    local mode="$1" ssh_config="$2" config_dir inc
+
+    [[ -r "$ssh_config" ]] || { echo "error: cannot read $ssh_config" >&2; exit 1; }
+    config_dir="$(cd "$(dirname "$ssh_config")" && pwd)"
+
+    # Relative paths in Include are resolved against ~/.ssh.
+    if [[ "$config_dir" == "$HOME/.ssh" ]]; then inc="Include sshm/config_*"; else inc="Include $config_dir/sshm/config_*"; fi
+
+    local present=off
+    grep -qxF "$inc" "$ssh_config" && present=on
+    if [[ -z "$mode" ]]; then
+        [[ "$present" == on ]] && mode=off || mode=on
+    fi
+    [[ "$mode" == "$present" ]] && { echo "include already $mode"; return 0; }
+
+    backup "$ssh_config"
+    local tmp
+    tmp="$(mktemp "$config_dir/.config.XXXXXX")"
+    if [[ "$mode" == on ]]; then
+        # must come before any Host block, otherwise it only applies inside it
+        { echo "$inc"; [[ -s "$ssh_config" && -n "$(head -n1 "$ssh_config")" ]] && echo; cat "$ssh_config"; } >"$tmp"
+    else
+        # drop the line and the blank separator right after it
+        awk -v inc="$inc" '$0 == inc { skip = 1; next } skip && /^$/ { skip = 0; next } { skip = 0; print }' "$ssh_config" >"$tmp"
+    fi
+    chmod 600 "$tmp"
+    mv "$tmp" "$ssh_config"
+    echo "include $mode: $inc"
 }
 
 [[ $# -ge 1 ]] || usage
 cmd="$1"; shift
 
 case "$cmd" in
-    import-inventory|import-known-hosts)
+    import)
         [[ $# -lt 1 || $# -gt 3 ]] && usage
-        parser="$inventory_parser"
-        [[ "$cmd" == import-known-hosts ]] && parser="$known_hosts_parser"
-        import_hosts "$1" "${2:-}" "${3:-$HOME/.ssh/config}" "$parser"
+        import_hosts "$1" "${2:-}" "${3:-$HOME/.ssh/config}"
         ;;
     move-cluster)
         [[ $# -gt 2 ]] && usage
         move_cluster "${1:-}" "${2:-$HOME/.ssh/config}"
+        ;;
+    include)
+        mode=""
+        [[ "${1:-}" == on || "${1:-}" == off ]] && { mode="$1"; shift; }
+        [[ $# -gt 1 ]] && usage
+        toggle_include "$mode" "${1:-$HOME/.ssh/config}"
         ;;
     *) usage ;;
 esac
