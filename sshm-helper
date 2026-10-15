@@ -24,8 +24,8 @@ move-cluster  move all hosts of a cluster (host name minus "-<role>-<index>") in
 include       include all sshm/config_* files from ssh_config (on), or not (off,
               the default). Without on/off the current state is toggled.
 
-ssh_config defaults to ~/.ssh/config. Backups go to sshm/backups next to it;
-backups older than 30 days are offered for deletion.
+ssh_config defaults to ~/.ssh/config. import backs it up to sshm/backups next
+to it first; the newest 7 backups are kept.
 EOF
     exit 1
 }
@@ -35,22 +35,23 @@ sshm_dir() {
     echo "$(cd "$(dirname "$1")" && pwd)/sshm"
 }
 
+# Backup before importing; only the newest 7 backups are kept
 backup() {
-    local dir answer stale
+    local dir name file old
     dir="$(sshm_dir "$1")/backups"
+    name="$(basename "$1")"
     mkdir -p "$dir"
     chmod 700 "$(dirname "$dir")" "$dir"
-    # keep the first backup of a second (import + split back up twice in one run)
-    local file="$dir/$(basename "$1").bak.$(date +%Y%m%d%H%M%S)"
+    # never overwrite: two runs in the same second keep the older state
+    file="$dir/$name.bak.$(date +%Y%m%d%H%M%S)"
     [[ -e "$file" ]] || cp "$1" "$file"
 
-    mapfile -t stale < <(find "$dir" -maxdepth 1 -type f -name '*.bak.*' -mtime +30)
-    if [[ ${#stale[@]} -gt 0 ]]; then
-        read -r -p "Delete ${#stale[@]} backups older than 30 days in $dir? [y/N] " answer || true
-        if [[ "$answer" =~ ^[Yy] ]]; then
-            rm -f -- "${stale[@]}"
-            echo "deleted ${#stale[@]} stale backups"
-        fi
+    # timestamps sort chronologically, so everything but the last 7 is old
+    shopt -s nullglob
+    old=("$dir/$name".bak.*)
+    shopt -u nullglob
+    if [[ ${#old[@]} -gt 7 ]]; then
+        rm -f -- "${old[@]:0:${#old[@]}-7}"
     fi
 }
 
@@ -176,7 +177,8 @@ move_cluster() {
         clusters_raw="$(awk '{ print $1 }' <<<"$selection" | paste -sd,)"
     fi
 
-    backup "$ssh_config"
+    mkdir -p "$config_dir/sshm"
+    chmod 700 "$config_dir/sshm"
 
     local clusters c target tmp moved inc
     IFS=',' read -r -a clusters <<<"$clusters_raw"
@@ -249,7 +251,6 @@ toggle_include() {
     fi
     [[ "$mode" == "$present" ]] && { echo "include already $mode"; return 0; }
 
-    backup "$ssh_config"
     local tmp
     tmp="$(mktemp "$config_dir/.config.XXXXXX")"
     if [[ "$mode" == on ]]; then

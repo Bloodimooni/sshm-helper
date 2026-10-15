@@ -22,4 +22,4 @@ sshm-helper include      [on|off] [ssh_config]
 - `move-cluster`: moves all hosts of a cluster (host name minus `-<role>-<index>`, e.g. `k8s-cloud-svcs-test-gw-0` → `k8s-cloud-svcs-test`) into `sshm/config_<cluster>` next to `ssh_config` (so `~/.ssh/sshm/`). It is deliberately not included from `ssh_config`, so the default sshm view stays small; open a cluster with `sshm -c ~/.ssh/sshm/config_<cluster>`. Without a cluster name a table (fzf, TAB for multi-select) lets you pick.
 - `include`: adds (`on`) or removes (`off`) a single `Include sshm/config_*` line at the top of `ssh_config`, so all cluster files show up in plain `sshm` and work with plain `ssh`. Without `on`/`off` it toggles. Off by default.
 
-`ssh_config` defaults to `~/.ssh/config`. Every command writes a backup to `~/.ssh/sshm/backups/` first and offers to delete backups older than 30 days.
+`ssh_config` defaults to `~/.ssh/config`. `import` writes a backup to `~/.ssh/sshm/backups/` first; only the newest 7 backups are kept.
